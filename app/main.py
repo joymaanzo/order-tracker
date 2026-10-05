@@ -1,3 +1,4 @@
+import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager
@@ -7,11 +8,64 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from opentelemetry import metrics, trace
+from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.logging import LoggingInstrumentor
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import BaseModel, Field
 
 
 DB_PATH = Path(os.getenv("ORDER_DB_PATH", "data/orders.db"))
 STATUSES = {"received", "preparing", "shipped", "delivered"}
+OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+OTLP_INSECURE = os.getenv(
+    "OTEL_EXPORTER_OTLP_INSECURE",
+    str(OTLP_ENDPOINT.startswith("http://")),
+).lower() == "true"
+
+
+resource = Resource.create({"service.name": "order-tracker"})
+
+tracer_provider = TracerProvider(resource=resource)
+tracer_provider.add_span_processor(
+    BatchSpanProcessor(OTLPSpanExporter(endpoint=OTLP_ENDPOINT, insecure=OTLP_INSECURE))
+)
+trace.set_tracer_provider(tracer_provider)
+
+metric_reader = PeriodicExportingMetricReader(
+    OTLPMetricExporter(endpoint=OTLP_ENDPOINT, insecure=OTLP_INSECURE),
+    export_interval_millis=5000,
+)
+meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+metrics.set_meter_provider(meter_provider)
+
+logger_provider = LoggerProvider(resource=resource)
+logger_provider.add_log_record_processor(
+    BatchLogRecordProcessor(
+        OTLPLogExporter(endpoint=OTLP_ENDPOINT, insecure=OTLP_INSECURE)
+    )
+)
+LoggingInstrumentor().instrument(set_logging_format=False)
+logging.getLogger().addHandler(
+    LoggingHandler(level=logging.INFO, logger_provider=logger_provider)
+)
+
+meter = metrics.get_meter("order-tracker")
+order_lookup_counter = meter.create_counter(
+    "order.lookup",
+    description="Number of order lookup requests",
+)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def connect():
@@ -55,7 +109,7 @@ def order_detail(row):
     order = as_dict(row)
     if order["priority"] == "express":
         placed_at = datetime.fromisoformat(order["created_at"])
-        estimated_at = placed_at.replace(day=placed_at.day + 2)
+        estimated_at = placed_at + timedelta(days=2)
         order["estimated_delivery"] = estimated_at.date().isoformat()
     return order
 
@@ -77,6 +131,22 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Order Tracker", lifespan=lifespan)
+FastAPIInstrumentor.instrument_app(app)
+
+
+@app.middleware("http")
+async def record_order_lookup(request, call_next):
+    response = await call_next(request)
+    route = request.scope.get("route")
+    if request.method == "GET" and getattr(route, "path", None) == "/api/orders/{order_id}":
+        order_lookup_counter.add(
+            1,
+            {
+                "http.route": route.path,
+                "http.response.status_code": response.status_code,
+            },
+        )
+    return response
 
 
 @app.get("/")
@@ -100,6 +170,7 @@ def list_orders():
 
 @app.get("/api/orders/{order_id}")
 def get_order(order_id: str):
+    logger.info("Looking up order", extra={"order_id": order_id})
     with connect() as db:
         row = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
     if row is None:
